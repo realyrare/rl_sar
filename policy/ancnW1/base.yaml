@@ -1,0 +1,104 @@
+# Copyright (c) 2024-2025 Ziqi Fan
+# SPDX-License-Identifier: Apache-2.0
+#里面的数值一部分"抄"自 URDF,一部分是围绕 URDF 做的正/逆运动学(FK/IK)算出来的,还有一部分是手调的增益/步态参数
+# IMPORTANT: every 16-long array in this file is in POLICY order, i.e.
+#   0..11  12 leg joints (fl_hip, fl_thigh, fl_calf, fr_..., hl_..., hr_...)
+#   12..15 4 wheel joints (fl_wheel, fr_wheel, hl_wheel, hr_wheel)
+# The FSM (Passive / GetUp / GetDown) writes motor_command with these indices and
+# SetCommand() translates them to the simulator with joint_mapping, so a wrong
+# order here silently feeds the wheel gains to leg joints.
+ancnW1:
+  dt: 0.005
+  decimation: 4
+  # wheels are velocity-actuated: no position gain at all
+  fixed_kp: [80.0, 80.0, 80.0,
+             80.0, 80.0, 80.0,
+             80.0, 80.0, 80.0,
+             80.0, 80.0, 80.0,
+             0.0, 0.0, 0.0, 0.0]
+  # wheels get a larger fixed damping while getting up: parking-brake effect
+  fixed_kd: [2.0, 2.0, 2.0,
+             2.0, 2.0, 2.0,
+             2.0, 2.0, 2.0,
+             2.0, 2.0, 2.0,
+             5.0, 5.0, 5.0, 5.0]
+  num_of_dofs: 16
+  wheel_indices: [12, 13, 14, 15]
+  # URDF effort limits: legs 113 N*m, wheels 19.3 N*m
+  torque_limits: [113.0, 113.0, 113.0,
+                  113.0, 113.0, 113.0,
+                  113.0, 113.0, 113.0,
+                  113.0, 113.0, 113.0,
+                  19.3, 19.3, 19.3, 19.3]
+  # standing pose: front legs fold backwards (thigh +0.6 / calf -1.0),
+  # hind legs fold forwards (thigh -0.6 / calf +1.0); wheel ends up right
+  # under the hip, 0.549 m below it (base at z = 0.549 + r_wheel 0.11 = 0.659).
+  # Geometric angles (no joint/@ref any more), so the MJCF zero pose is the URDF
+  # zero pose: base 0.537 at spawn, GetUp lifts the robot to this pose at 0.659.
+  default_dof_pos: [ 0.00,  0.60, -1.00,
+                     0.00,  0.60, -1.00,
+                     0.00, -0.60,  1.00,
+                     0.00, -0.60,  1.00,
+                     0.00,  0.00,  0.00,  0.00]
+  # in-place shaking (FSM state "RLFSMStateJitter", keyboard '2')
+  # small fast tremor around the standing pose, the wheels never leave the ground
+  jitter_amp: 0.05           # rad on the thigh, ~1.0 cm of wheel motion抖动模式幅度频率
+  jitter_freq: 5.0           # Hz
+  jitter_calf_ratio: 2.0     # dcalf = -ratio * dthigh, same direction as the lift
+  jitter_phase_spread: 0.0   # 0 = all legs in phase (body bounces), 0.5 = diagonal pairs opposed
+  jitter_bias: 0.0           # 0 = symmetric sine, 1 = only lift (never press down)
+  jitter_transition: 0.5     # seconds spent interpolating into the standing pose
+  # jitter_leg_kp / jitter_leg_kd: set both > 0 to override fixed_kp/fixed_kd while shaking
+
+  # in-place stepping (FSM state "RLFSMStateStepInPlace", keyboard '3')
+  # period of one full gait cycle
+  step_period: 1.0
+  # swing amplitude in rad: thigh moves by -s (front) / +s (hind) and the calf by
+  # +2s / -2s, which lifts the wheel straight up. 0.203 m per rad
+  step_lift: 0.45
+  # the planted legs extend by this much (same sign convention, negative lift),
+  # which pushes the body up and adds to the clearance of the pair in the air;
+  # set to 0 to disable. Total clearance ~= 0.203 * (step_lift + step_stance_drop)
+  # 0.45 + 0.10 -> ~11 cm (joint limits are far away: thigh +-2.3, calf +-2.8)
+  step_stance_drop: 0.10
+  # dcalf = -step_calf_ratio * dthigh, keeps the wheel right below the hip
+  step_calf_ratio: 2.0
+  # seconds spent interpolating into the standing pose before the gait starts
+  step_transition: 0.8
+  # fraction of the cycle a leg spends in the air (bigger = longer flight)
+  step_duty: 0.40
+  # parking brake applied to the wheels while stepping. The wheels are velocity
+  # joints during GetUp/RL (kp = 0), i.e. damping only, which lets the robot creep
+  # ~0.09 m/s. Holding the wheel angle instead (kp > 0) keeps it in place;
+  # step_wheel_kp: 0 restores the damping-only behaviour.
+  step_wheel_kp: 15.0
+  step_wheel_kd: 2.0
+  # step in place while spinning (FSM state "RLFSMStateStepTurn", keyboard '4')
+  # body yaw rate, + = counter-clockwise (left wheels back, right wheels forward)
+  step_yaw_rate: 0.6
+  # wheel rate = yaw_rate * step_turn_half_track / step_turn_wheel_radius (URDF:
+  # 0.22 m half track, 0.11 m wheel radius -> wheel rate = 2 * yaw_rate)
+  step_turn_half_track: 0.22
+  step_turn_wheel_radius: 0.11
+  # set > 0 to command the wheel rate directly, bypassing the geometry above
+  step_turn_wheel_omega: 0.0
+
+  # true : diagonal trot, fl+hr and fr+hl alternate (default - the two planted
+  #        wheels lie on a line through the CoM, so the lifted pair really leaves
+  #        the ground: contact alternates 2 diagonal wheels <-> 4 wheels)
+  # false: 4-beat crawl, one wheel in the air at a time (three planted wheels, but
+  #        the body sinks towards the missing leg and the lift gets cancelled out)
+  step_trot: true
+  # policy index -> MJCF/physical joint index. The MJCF (converted from the URDF)
+  # is ordered per leg (hip, thigh, calf, wheel), so the wheels sit at 3/7/11/15.
+  joint_mapping: [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 3, 7, 11, 15]
+  joint_names: ["fl_hip_joint", "fl_thigh_joint", "fl_calf_joint",
+                "fr_hip_joint", "fr_thigh_joint", "fr_calf_joint",
+                "hl_hip_joint", "hl_thigh_joint", "hl_calf_joint",
+                "hr_hip_joint", "hr_thigh_joint", "hr_calf_joint",
+                "fl_wheel_joint", "fr_wheel_joint", "hl_wheel_joint", "hr_wheel_joint"]
+  joint_controller_names: ["fl_hip_controller", "fl_thigh_controller", "fl_calf_controller",
+                           "fr_hip_controller", "fr_thigh_controller", "fr_calf_controller",
+                           "hl_hip_controller", "hl_thigh_controller", "hl_calf_controller",
+                           "hr_hip_controller", "hr_thigh_controller", "hr_calf_controller",
+                           "fl_wheel_controller", "fr_wheel_controller", "hl_wheel_controller", "hr_wheel_controller"]

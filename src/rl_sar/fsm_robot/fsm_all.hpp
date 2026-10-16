@@ -7,6 +7,7 @@
 #define FSM_ALL_HPP
 
 #include "fsm_a1.hpp"
+#include "fsm_ancnW1.hpp"
 #include "fsm_b2.hpp"
 #include "fsm_b2w.hpp"
 #include "fsm_d1.hpp"
@@ -17,6 +18,6 @@
 #include "fsm_gr1t2.hpp"
 #include "fsm_l4w4.hpp"
 #include "fsm_lite3.hpp"
+#include "fsm_m20.hpp"
 #include "fsm_tita.hpp"
-
 #endif // FSM_ALL_HPP

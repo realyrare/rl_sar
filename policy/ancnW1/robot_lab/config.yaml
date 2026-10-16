@@ -1,0 +1,117 @@
+# Copyright (c) 2024-2025 Ziqi Fan
+# SPDX-License-Identifier: Apache-2.0
+
+# IMPORTANT - array ordering
+# --------------------------
+# Every per-joint array in THIS file is indexed by POLICY index:
+#   0..11  12 leg joints (fl_hip, fl_thigh, fl_calf, fr_..., hl_..., hr_...)
+#   12..15 4 wheel joints (fl_wheel, fr_wheel, hl_wheel, hr_wheel)
+# i.e. write 12 leg values FIRST and append the 4 wheel values at the end
+# (same style as policy/go2w/robot_lab/config.yaml). The policy index is mapped
+# to the MJCF/physical index by `joint_mapping` at the bottom of this file.
+#
+# Observation dimension
+# ---------------------
+# actor.0.weight is [512, 57]. Column norms per block:
+#   cols  0- 2  ang_vel     9.52
+#   cols  3- 5  gravity_vec 10.60
+#   cols  6- 8  commands     6.57
+#   cols  9-24  joint_pos   11.11
+#   cols 25-40  joint_vel    9.02
+#   cols 41-56  actions      1.66   <- trained, but strongly suppressed
+# No block sits at the random-init baseline (min column norm 0.94 belongs to the
+# suppressed `actions` block), so all 57 columns were fed during training.
+# Same 3+3+3+16+16+16 layout as go2w / b2w.
+#
+# Joint order check (derived from the weights, see tools/notes)
+# -------------------------------------------------------------
+# - vx=+1 -> all four wheel outputs negative (-2.9/-2.1/-2.2/-2.4). The MJCF wheel
+#   axis is (0,-1,0), so a positive wheel rate drives the base towards -x; the
+#   policy therefore commands negative rates for +x, i.e. the wheel sign is right.
+# - vyaw=+1 -> wheels [+0.91, -0.96, +0.56, -0.17] = left wheels backwards,
+#   right wheels forwards = CCW yaw, so the wheel block order is fl, fr, hl, hr.
+# - dof_pos[j] perturbations couple j=1,2->wheel12, 4,5->wheel13, 7,8->wheel14,
+#   10,11->wheel15, i.e. the 12 leg dims are grouped per leg fl, fr, hl, hr.
+ancnW1/robot_lab:
+  model_name: "policy.pt"
+  num_observations: 57
+  observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions"]
+  observations_history: []  # 0 is the latest observation
+  observations_history_priority: "time"  # "time" or "term" priority
+  default_commands: [0.0, 0.0, 0.0]
+  clip_obs: 100.0
+  # legs keep the training-side +-100 clip.
+  # wheels: the URDF wheel velocity limit is 94.248 rad/s and MuJoCo has no joint
+  # velocity limit, so the action is clipped here instead: 94.248 / 5.0 = 18.85.
+  clip_actions_upper: [100.0, 100.0, 100.0,
+                       100.0, 100.0, 100.0,
+                       100.0, 100.0, 100.0,
+                       100.0, 100.0, 100.0,
+                       18.85, 18.85, 18.85, 18.85]
+  clip_actions_lower: [-100.0, -100.0, -100.0,
+                       -100.0, -100.0, -100.0,
+                       -100.0, -100.0, -100.0,
+                       -100.0, -100.0, -100.0,
+                       -18.85, -18.85, -18.85, -18.85]
+  # rl_sar applies the position term twice (output_dof_tau + SetCommand's
+  # kp*(cmd_q - q)), so the effective stiffness/damping are 2x the values below:
+  # legs 40/1.0 here == Isaac stiffness 80 / damping 2.0.
+  # The wheel rows are the LAST 4 entries - wheels are velocity-actuated, they
+  # must never receive a position stiffness.
+  rl_kp: [40.0, 40.0, 40.0,
+          40.0, 40.0, 40.0,
+          40.0, 40.0, 40.0,
+          40.0, 40.0, 40.0,
+          0.0, 0.0, 0.0, 0.0]
+  rl_kd: [1.0, 1.0, 1.0,
+          1.0, 1.0, 1.0,
+          1.0, 1.0, 1.0,
+          1.0, 1.0, 1.0,
+          0.6, 0.6, 0.6, 0.6]
+  fixed_kp: [80.0, 80.0, 80.0,
+             80.0, 80.0, 80.0,
+             80.0, 80.0, 80.0,
+             80.0, 80.0, 80.0,
+             0.0, 0.0, 0.0, 0.0]
+  fixed_kd: [2.0, 2.0, 2.0,
+             2.0, 2.0, 2.0,
+             2.0, 2.0, 2.0,
+             2.0, 2.0, 2.0,
+             5.0, 5.0, 5.0, 5.0]
+  num_of_dofs: 16
+  # legs: hip 0.125, thigh/calf 0.25 (position action)
+  # wheels: velocity action, scale 5.0 rad/s per unit action
+  action_scale: [0.125, 0.25, 0.25,
+                 0.125, 0.25, 0.25,
+                 0.125, 0.25, 0.25,
+                 0.125, 0.25, 0.25,
+                 5.0, 5.0, 5.0, 5.0]
+  wheel_indices: [12, 13, 14, 15]
+  # false = do NOT add -rl_kd*dq to the wheel feed-forward torque. rl_sar would
+  # otherwise apply the wheel damping twice (ComputeOutput + SetCommand) and the
+  # tracked wheel speed would be half the command. Isaac's DCMotor is
+  #   torque = damping * (v_cmd - dq)
+  # which is exactly what SetCommand alone produces, so false is the faithful
+  # sim2sim setting (see rl_sdk.cpp ComputeOutput).
+  wheel_tau_damping: false
+  lin_vel_scale: 2.0
+  ang_vel_scale: 0.25
+  dof_pos_scale: 1.0
+  dof_vel_scale: 0.05
+  commands_scale: [1.0, 1.0, 1.0]
+  torque_limits: [113.0, 113.0, 113.0,
+                  113.0, 113.0, 113.0,
+                  113.0, 113.0, 113.0,
+                  113.0, 113.0, 113.0,
+                  19.3, 19.3, 19.3, 19.3]
+  default_dof_pos: [ 0.00,  0.60, -1.00,
+                     0.00,  0.60, -1.00,
+                     0.00, -0.60,  1.00,
+                     0.00, -0.60,  1.00,
+                     0.00,  0.00,  0.00,  0.00]
+  # policy index -> MJCF/physical joint index
+  # MJCF joint order is depth-first: fl_hip, fl_thigh, fl_calf, fl_wheel,
+  #                                  fr_hip, fr_thigh, fr_calf, fr_wheel,
+  #                                  hl_hip, hl_thigh, hl_calf, hl_wheel,
+  #                                  hr_hip, hr_thigh, hr_calf, hr_wheel
+  joint_mapping: [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 3, 7, 11, 15]
