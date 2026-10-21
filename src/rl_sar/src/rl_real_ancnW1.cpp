@@ -21,8 +21,11 @@
 #include "rl_real_ancnW1.hpp"
 
 #include <chrono>
+#include <csignal>   // signal() / sig_atomic_t（主线程退出等待）
 #include <iostream>
 #include <thread>
+
+#include <unistd.h>  // sleep()（主线程退出等待）
 
 #include "logger.hpp"
 
@@ -58,11 +61,31 @@ RL_Real_AncnW1::RL_Real_AncnW1(int argc, char **argv)
                   << this->robot_name << std::endl;
     }
 
-    // 3. RL 框架初始化
+    // 3. 关节数 / 输出 / 控制的基本初始化（数据源是 base.yaml 的 num_of_dofs）
+    //
+    // ⚠ 这里**刻意不调用 InitRL()**，这是修掉的一个致命 bug：
+    //
+    //   InitRL(robot_config_path) 的参数是"机器人/配置"形式的路径，
+    //   例如 "ancnW1/robot_lab"，**不是 robot_name**。
+    //   早期版本写的是 InitRL(this->robot_name) 即 "ancnW1"，于是：
+    //     读 policy/ancnW1/config.yaml（不存在，真正的文件在 robot_lab/ 下）
+    //     → ReadYaml 捕获 BadFile 后静默 return，params 里没有 model_name
+    //     → model_name 取到空串，model_path 变成 ".../ancnW1/"
+    //     → load_model() 抛 "Unknown model file extension: ."
+    //     → 构造函数里没人接，std::terminate 直接核心转储。
+    //   表现为：**真机一上电就 abort，连 Passive 都进不去**（exit code 134）。
+    //
+    //   模型与观测的真正初始化交给 FSMManager 按需完成：
+    //   进入 RLFSMStateRLLocomotion 时，该状态的 Enter() 会调用
+    //   InitRL("ancnW1/robot_lab")，并且带 try/catch 兜底
+    //   （见 fsm_robot/fsm_ancnW1.hpp 的 RLLocomotion::Enter）。
+    //   RunModel() 有 rl_init_done 前置判断，未进入行走态时不会碰 obs，
+    //   因此构造阶段不做 RL 初始化是安全的。
+    //
+    //   顺带的好处：不必在启动时白白加载一次模型，等真正要用时再加载。
     this->InitJointNum(this->params.Get<int>("num_of_dofs"));
     this->InitOutputs();
     this->InitControl();
-    this->InitRL(this->robot_name);
 
     // 4. 配置电机类型表（BOM 确认后填具体型号阈值）
     ConfigureMotorTypes();
@@ -112,9 +135,19 @@ RL_Real_AncnW1::RL_Real_AncnW1(int argc, char **argv)
 RL_Real_AncnW1::~RL_Real_AncnW1()
 {
     // 1. 停止循环
+    //
+    // ⚠ shutdown() 只把 _running 置 false 并通知，**并不会 join**：
+    //   LoopFunc::start() 已经把线程 detach 了，joinable() 恒为 false，
+    //   所以那个 `if (_thread.joinable()) _thread.join();` 永远不执行。
+    //   线程要等自己下一轮循环才会检查 _running 并退出，
+    //   最长的是 keyboard 线程（周期 50ms）。
+    //   下面紧接着就要销毁成员（motor_fsm_ / can_ / loop_*），
+    //   若不等待，仍可能有线程正访问这些对象 —— 概率性 use-after-free。
+    //   留 60ms 余量（> 50ms 最长周期）。
     if (loop_keyboard_) loop_keyboard_->shutdown();
     if (loop_control_) loop_control_->shutdown();
     if (loop_rl_) loop_rl_->shutdown();
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
     // 2. 失能所有电机（安全收尾）
     if (can_opened_ && motor_fsm_.State() == MotorFsmState::Enabled)
@@ -586,9 +619,53 @@ void RL_Real_AncnW1::RunModel()
 // main
 // ============================================================================
 
+// ============================================================================
+// 信号处理与主循环
+// ============================================================================
+
+// 退出请求标志。
+//   sig_atomic_t 是标准保证"信号处理函数可安全读写"的整型；
+//   volatile 防止编译器把它缓存进寄存器，导致 while 循环看不到变化。
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
+static void SignalHandler(int signum)
+{
+    std::cout << LOGGER::INFO << "Received signal " << signum << ", shutting down..." << std::endl;
+    g_shutdown_requested = 1;
+}
+
 int main(int argc, char **argv)
 {
+    // 同时接管 SIGINT(Ctrl+C) 与 SIGTERM(kill / systemd stop)。
+    // 两者都必须走"先失能电机、再关 CAN"的析构流程，不能被直接杀掉，
+    // 否则电机可能停在使能状态。
+    signal(SIGINT, SignalHandler);
+    signal(SIGTERM, SignalHandler);
+
     ancn_w1::RL_Real_AncnW1 node(argc, argv);
     node.Run();
-    return 0;
+
+    // 阻塞主线程，直到收到退出信号。
+    //
+    // ⚠ 这一段**绝对不能省**，否则真机启动约 300ms 后必定 SIGSEGV：
+    //
+    //   LoopFunc::start() 内部把工作线程 detach() 掉了；
+    //   于是 shutdown() 里的 `if (_thread.joinable()) _thread.join();`
+    //   恒为 false —— 它只把 _running 置 false 就返回，**从未等待线程真正退出**。
+    //   若 main 在 Run() 之后直接 return 0，node 立刻析构，
+    //   而 keyboard / control / rl 三个分离线程仍在运行、仍在访问
+    //   已销毁的 LoopFunc 与电机状态机成员 —— 典型的 use-after-free。
+    //
+    //   这正是回归测试中"启动 319ms 后段错误(退出码 139)"的根因。
+    //   项目里其他真机（go2 / a1 / d1 / l4w4 / lite3）都有同样的等待兜住。
+    //
+    //   用 sleep(1) 而非忙等：CPU 占用可忽略，且它会被信号打断(EINTR)，
+    //   使退出请求能在约 1 秒内得到响应。
+    while (!g_shutdown_requested)
+    {
+        sleep(1);
+    }
+
+    std::cout << LOGGER::INFO << "[ancnW1] Exiting..." << std::endl;
+    return 0;  // 返回后 node 析构 → 停循环 → 失能电机 → 关闭 CAN
 }
