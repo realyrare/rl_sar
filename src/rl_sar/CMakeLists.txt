@@ -592,6 +592,33 @@ if(SYSTEM_TYPE STREQUAL "Linux")
     endif()
 endif()
 
+# executable for rl real ancnW1 (CAN-FD, 16 关节电机：12 腿 + 4 轮)
+if(SYSTEM_TYPE STREQUAL "Linux")
+    add_executable(rl_real_ancnW1
+        src/rl_real_ancnW1.cpp
+        src/ancnW1_can_interface.cpp
+        src/ancnW1_motor_driver.cpp
+        src/ancnW1_motor_fsm.cpp
+    )
+    target_link_libraries(rl_real_ancnW1
+        rl_sdk
+        observation_buffer
+        ${YAML_CPP_LIBRARIES}
+        Threads::Threads
+    )
+    if(NOT USE_CMAKE)
+        if($ENV{ROS_DISTRO} MATCHES "noetic")
+            target_link_libraries(rl_real_ancnW1 ${catkin_LIBRARIES})
+        elseif($ENV{ROS_DISTRO} MATCHES "foxy|humble")
+            ament_target_dependencies(rl_real_ancnW1
+                rclcpp
+                geometry_msgs
+            )
+            install(TARGETS rl_real_ancnW1 DESTINATION lib/${PROJECT_NAME})
+        endif()
+    endif()
+endif()
+
 # executable for actuator net
 if(NOT USE_CMAKE)
     if($ENV{ROS_DISTRO} MATCHES "noetic")

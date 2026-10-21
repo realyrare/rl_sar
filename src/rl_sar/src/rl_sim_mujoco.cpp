@@ -79,6 +79,19 @@ RL_Sim::RL_Sim(int argc, char **argv)
 
     this->mj_model = m;
     this->mj_data = d;
+
+    // 若模型定义了 keyframe（如站立姿态），出生即复位到第一个 keyframe。
+    // MuJoCo 默认初始姿态是"关节全零 + body 定义位置"，某些构型（如轮腿）
+    // 零位落地会翻倒。没有 keyframe 的模型完全不受影响。
+    if (this->mj_model && this->mj_data && this->mj_model->nkey > 0)
+    {
+        mj_resetDataKeyframe(this->mj_model, this->mj_data, 0);
+        mj_forward(this->mj_model, this->mj_data);
+        std::cout << LOGGER::INFO << "Reset to keyframe[0] \""
+                  << (mj_id2name(this->mj_model, mjOBJ_KEY, 0) ? mj_id2name(this->mj_model, mjOBJ_KEY, 0) : "?")
+                  << "\", base z = " << this->mj_data->qpos[2] << std::endl;
+    }
+
     this->SetupSysJoystick("/dev/input/js0", 16); // 16 bits joystick
 
     // read params from yaml
@@ -200,7 +213,14 @@ void RL_Sim::RobotControl()
     {
         if (this->mj_model && this->mj_data)
         {
-            mj_resetData(this->mj_model, this->mj_data);
+            if (this->mj_model->nkey > 0)
+            {
+                mj_resetDataKeyframe(this->mj_model, this->mj_data, 0);
+            }
+            else
+            {
+                mj_resetData(this->mj_model, this->mj_data);
+            }
             mj_forward(this->mj_model, this->mj_data);
         }
     }
