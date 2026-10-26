@@ -180,6 +180,10 @@ struct Observations
     std::vector<T> dof_pos;
     std::vector<T> dof_vel;
     std::vector<T> actions;
+    // 地形高度扫描，对应 IsaacLab 的 mdp.height_scan。
+    // 行优先铺开的一维向量，长度 = height_scan_grid_x * height_scan_grid_y（M20 为 17*11=187），
+    // 由硬件相关层（仿真/真机）负责填充，不用它们时保持为空向量。
+    std::vector<T> height_scan;
 };
 
 class RL

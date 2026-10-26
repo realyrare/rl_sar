@@ -205,6 +205,94 @@ void RL_Sim::RobotControl()
     // Lock the sim mutex once for the entire control cycle to prevent race conditions
     const std::lock_guard<std::recursive_mutex> lock(sim->mtx);
 
+    // 地形几何体位于 group 3（专供 height_scan 射线过滤）。渲染线程的
+    // RenderLoop() 启动时会调用 mjv_defaultOption() 把渲染选项整个重置
+    // （group 3 默认不可见），构造前对 mjvOption 所做的修改会被覆盖。
+    // 因此必须在并行运行的控制周期里持续打开该组，地形才能在窗口中显示。
+    sim->opt.geomgroup[3] = 1;
+
+    // --------------------------------------- 第三人称跟随视角（一直保持 Free 相机，按 Z 开关）
+    //
+    // 【为什么不再用 cam.type = Tracking】：simulate 的 UI 会【根据 cam.type 反向把 Camera
+    // 下拉框刷回去】—— 即 mjui 那边写着 "type==TRACKING ⇒ camera=1"。于是只要代码侧每个
+    // 控制周期写一次 type，就等于和用户点下拉框互抢，用户点 Free 后立刻被顶回 Tracking，
+    // 表现为"面板切 Free 切不过来"。
+    //
+    // 【现在的做法】：相机始终保持 Free 类型，"跟拍"效果完全由本文件自己更新 lookat /
+    // azimuth 来模拟。面板上的 Camera 下拉框因此永远是 Free，没有任何代码去改写它，用户
+    // 随时可以用鼠标自由旋转/平移/缩放；按 Z 关闭跟拍，镜头就在原地悬停不再追。
+    if (this->mj_model && this->mj_data)
+    {
+        static const char *kFollowBody = "base_link";   // M20 机身刚体名
+        static int follow_body_id = -2;
+        static bool follow_enabled = true;              // 默认开启跟拍
+        static bool follow_ready = false;               // 首帧是否已摆好机位
+        static int last_key_code = -1;
+
+        if (follow_body_id == -2)
+        {
+            follow_body_id = mj_name2id(this->mj_model, mjOBJ_BODY, kFollowBody);
+            if (follow_body_id < 0)
+            {
+                follow_enabled = false;
+                std::cout << LOGGER::WARNING << "Camera: 未找到刚体 \"" << kFollowBody
+                          << "\"，跟随视角不可用" << std::endl;
+            }
+        }
+
+        // 用户若在面板里显式选了 Tracking，就把镜头控制权完整让给 mjui，不再插手
+        if (follow_enabled && sim->camera == 1)
+        {
+            follow_enabled = false;
+            follow_ready = false;
+        }
+
+        // 按 Z 开关跟拍（边沿触发：按一次只翻一次，长按不会连续抖动）
+        int key_code = static_cast<int>(this->control.current_keyboard);
+        if (key_code == static_cast<int>(Input::Keyboard::Z) && key_code != last_key_code)
+        {
+            follow_enabled = !follow_enabled;
+            follow_ready = false;                       // 重新摆一次机位
+            std::cout << LOGGER::INFO << "Camera follow: "
+                      << (follow_enabled ? "ON（再按 Z 关闭）"
+                                         : "OFF（镜头已悬停，交还给你：左键旋转 / 右键平移 / 滚轮缩放；面板 Camera 保持 Free）")
+                      << std::endl;
+        }
+        last_key_code = key_code;
+
+        if (follow_enabled && follow_body_id >= 0)
+        {
+            const mjtNum *p = this->mj_data->xpos + 3 * follow_body_id;   // 机身世界坐标
+            const mjtNum *q = this->mj_data->xquat + 4 * follow_body_id;  // 机身姿态四元数
+            double yaw = atan2(2.0 * (q[0] * q[3] + q[1] * q[2]),
+                               1.0 - 2.0 * (q[2] * q[2] + q[3] * q[3]));
+
+            sim->cam.type = mjCAMERA_FREE;   // 关键：永远是 Free，下拉框不会被抢
+            sim->camera = 0;
+
+            if (!follow_ready)               // distance / elevation 只在这里摆一次，
+            {                                // 之后交给用户滚轮调整，不再强行覆盖
+                sim->cam.distance = 1.9;     // 机位离机身约 1.9 m
+                sim->cam.elevation = -14.0;  // 略高的俯视角，能看见地形起伏
+                sim->cam.lookat[0] = p[0];
+                sim->cam.lookat[1] = p[1];
+                sim->cam.lookat[2] = p[2] + 0.15;
+                follow_ready = true;
+                std::cout << LOGGER::INFO
+                          << "Camera: 第三人称跟拍已开启（面板 Camera 始终为 Free，可自由拖动）；按 Z 关闭"
+                          << std::endl;
+            }
+
+            // lookat 做一阶低通后再跟随，避免机身的高频抖动直接传导到画面
+            double tx[3] = {p[0], p[1], p[2] + 0.15};
+            for (int i = 0; i < 3; ++i)
+            {
+                sim->cam.lookat[i] += 0.25 * (tx[i] - sim->cam.lookat[i]);
+            }
+            sim->cam.azimuth = yaw * 180.0 / 3.14159265358979 + 170.0;    // 170°≈机身正后方
+        }
+    }
+
     this->GetState(&this->robot_state);
 
     this->StateController(&this->robot_state, &this->robot_command);
@@ -347,6 +435,118 @@ void RL_Sim::GetSysJoystick()
     }
 }
 
+void RL_Sim::UpdateHeightScan()
+{
+    if (this->obs.height_scan.empty() || !this->mj_model || !this->mj_data)
+    {
+        return;
+    }
+
+    const int grid_x = this->params.Get<int>("height_scan_grid_x", 17);
+    const int grid_y = this->params.Get<int>("height_scan_grid_y", 11);
+    const float step = this->params.Get<float>("height_scan_resolution", 0.1f);
+    const float range = this->params.Get<float>("height_scan_range", 2.0f);
+    const int group = this->params.Get<int>("height_scan_geom_group", 3);
+    // 命中点世界高度的额外偏移（米）。默认 0 = 直接输出世界高度（平地约 0）。
+    // 若日后确认策略是以基座为基准训练的，把它设成「基座站立高度」即可切换回去。
+    const float height_scan_ref = this->params.Get<float>("height_scan_ref_offset", 0.0f);
+
+    // 与 IsaacLab 的 RayCaster(attach_yaw_only=True) 对齐：
+    // 网格只跟随基座的偏航角，射线永远铅垂向下，不受俯仰/滚转的影响。
+    int base_id = mj_name2id(this->mj_model, mjOBJ_BODY, "base_link");
+    if (base_id < 0)
+    {
+        if (!height_scan_warned)
+        {
+            height_scan_warned = true;
+            std::cout << LOGGER::WARNING << "[HeightScan] 模型中找不到 body \"base_link\"，已跳过地形扫描" << std::endl;
+        }
+        return;
+    }
+
+    const mjtNum *pos = this->mj_data->xpos + 3 * base_id;
+    const mjtNum *xmat = this->mj_data->xmat + 9 * base_id;
+    // xmat 行优先，第一列即机体系 x 轴在世界系下的方向，据此取偏航角
+    float yaw = atan2f((float)xmat[3], (float)xmat[0]);
+    float cy = cosf(yaw);
+    float sy = sinf(yaw);
+
+    // 只对地形所在的 group 发射射线，避免打到机器人自己的腿脚
+    mjtByte geomgroup[mjNGROUP] = {0};
+    int group_idx = (group >= 0 && group < mjNGROUP) ? group : 0;
+    geomgroup[group_idx] = 1;
+
+    int missed = 0;
+    size_t k = 0;
+    for (int ix = 0; ix < grid_x; ++ix)
+    {
+        float bx = (ix - (grid_x - 1) * 0.5f) * step;
+        for (int iy = 0; iy < grid_y; ++iy)
+        {
+            float by = (iy - (grid_y - 1) * 0.5f) * step;
+            mjtNum pnt[3] = {
+                pos[0] + (mjtNum)(cy * bx - sy * by),
+                pos[1] + (mjtNum)(sy * bx + cy * by),
+                pos[2]
+            };
+            mjtNum vec[3] = {0.0, 0.0, -(mjtNum)range};
+            int hit_geomid = -1;
+            mjtNum dist = mj_ray(this->mj_model, this->mj_data, pnt, vec, geomgroup, 1, -1, &hit_geomid);
+            if (dist >= 0.0)
+            {
+                // ① mj_ray 的返回值是按「射线向量长度」归一化的，不是米数。
+                //    实测：vec 长 1.0 返回 0.5900，长 2.0 返回 0.2950，长 4.0 返回 0.1475，
+                //    即 返回值 = 真实距离 / |vec|。这里 |vec| = range，故须乘回 range。
+                const double real_dist = (double)dist * (double)range;
+                // ② 参考基准对齐 IsaacLab：mdp.height_scan 默认 offset=0，返回的是
+                //    命中点的世界高度（平地约 0）。若改用「基座到地面的距离」，
+                //    平地会变成 0.59，等于给 187 维输入整体加了一个训练时从未出现的
+                //    常量偏置，策略会持续输出错误动作。
+                const double hit_z = (double)pos[2] - real_dist;
+                this->obs.height_scan[k] = (float)(hit_z - height_scan_ref);
+            }
+            else
+            {
+                // 未命中（地形不在该 group，或该点悬空）：按「地形极高」处理，clip 后到上限
+                this->obs.height_scan[k] = (float)((double)range - height_scan_ref);
+                ++missed;
+            }
+            ++k;
+        }
+    }
+
+    // 首次采样后打印一次统计，用于快速核对数值是否落在合理范围：
+    // 平地上应接近 0（世界高度基准）；若全是射程上限说明射线打空了。
+    if (!height_scan_warned)
+    {
+        height_scan_warned = true;
+        float hs_min = this->obs.height_scan[0];
+        float hs_max = this->obs.height_scan[0];
+        float hs_sum = 0.0f;
+        for (float v : this->obs.height_scan)
+        {
+            if (v < hs_min)
+            {
+                hs_min = v;
+            }
+            if (v > hs_max)
+            {
+                hs_max = v;
+            }
+            hs_sum += v;
+        }
+        std::cout << LOGGER::INFO << "[HeightScan] 地形扫描已启用：点数 " << this->obs.height_scan.size()
+                  << "，最小 " << hs_min << " m / 最大 " << hs_max << " m / 均值 "
+                  << (hs_sum / this->obs.height_scan.size()) << " m，未命中 " << missed << " 个" << std::endl;
+        if (missed == (int)this->obs.height_scan.size())
+        {
+            std::cout << LOGGER::WARNING << "[HeightScan] 全部采样点都未命中地形（geom group = " << group
+                      << "）。请确认场景中地形 geom 的 group 与 height_scan_geom_group 一致，"
+                      << "否则喂给模型的一律是射程上限。" << std::endl;
+        }
+    }
+}
+
 void RL_Sim::RunModel()
 {
     if (this->rl_init_done && simulation_running)
@@ -366,6 +566,7 @@ void RL_Sim::RunModel()
         this->obs.base_quat = this->robot_state.imu.quaternion;
         this->obs.dof_pos = this->robot_state.motor_state.q;
         this->obs.dof_vel = this->robot_state.motor_state.dq;
+        this->UpdateHeightScan();
 
         this->obs.actions = this->Forward();
         this->ComputeOutput(this->obs.actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);

@@ -66,6 +66,10 @@ private:
     void SetCommand(const RobotCommand<float> *command) override;
     void RunModel();
     void RobotControl();
+    // 地形高度扫描：用射线采样基座周围的地面高度，填到 obs.height_scan。
+    // 只有配置了 height_scan_grid_x / height_scan_grid_y 的机型才会真正执行。
+    void UpdateHeightScan();
+    bool height_scan_warned = false;
 
     // loop
     std::shared_ptr<LoopFunc> loop_keyboard;

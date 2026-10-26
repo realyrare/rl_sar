@@ -28,14 +28,12 @@ m20/robot_lab:
   # 二、观测（Observations）—— 模型「看」到什么
   # ---------------------------------------------------------------------------
   # 观测向量按 observations 列表的顺序依次拼接而成。
-  # 当前模型是平地（flat）策略，依据同目录 policy_meta.json：
-  #   source_checkpoint: .../deeprobotics_m20_flat/2026-09-29_10-54-38/model_4999.pt
-  #   obs_dim = 57, action_dim = 16, obs_normalization = false
+  # 当前模型是复杂地形（rough）策略，输入 244 维：
+  # 本体感知 57 维 + 地形高度扫描 187 维。
+  # 实测报错确证：mat1 and mat2 shapes cannot be multiplied (1x57 and 244x512)
   #
-  # ★ 这里曾经配过 rough 地形模型（带 height_scan，共 174 维）。
-  #   那个模型需要给框架新增 height_scan 观测类型才能跑；
-  #   现已换回平地模型，框架已回退原始状态，本文件也不再需要任何
-  #   height_scan 参数——平地场景只看这一份配置即可，不要再加回来。
+  # 注意：同目录的 policy_meta.json 还是旧平地模型（57 维）的元信息，未随模型更新，
+  #       不要用它判断当前维度，以 num_observations 与实测为准。
   #
   # 各分量维度推导：
   #   ang_vel      → 3   (机体角速度 ωx, ωy, ωz)
@@ -72,12 +70,18 @@ m20/robot_lab:
   #      正是把轮子（索引 12~15）置零 —— 与这里的 wheel_indices 完全吻合。
   # ===========================================================================
 
-  num_observations: 57
+  # 244 = 本体感知 57 + 地形高度扫描 187。
+  # 实测报错确证：mat1 and mat2 shapes cannot be multiplied (1x57 and 244x512)
+  # 即复杂地形策略的输入是 244 维，而这里原先只有 57 维。
+  num_observations: 244
 
   # 观测拼接顺序。改动这里就等于改动喂给网络的数据结构，
   # 必须与训练时完全一致，否则等于给模型喂乱码。
-  # 57 = 3 + 3 + 3 + 16 + 16 + 16，与 policy_meta.json 的 obs_dim 一致。
-  observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions"]
+  #   本体 57  = ang_vel 3 + gravity_vec 3 + commands 3 + dof_pos 16 + dof_vel 16 + actions 16
+  #   地形 187 = 17 × 11 的高度扫描网格
+  # 顺序取自训练侧 rough_env_cfg.py 的 observations.policy 组：
+  # 本体感知在前，height_scan 在最后（mdp.height_scan）。
+  observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions", "height_scan"]
 
   # 历史观测帧。空数组 = 只用当前帧，不使用历史堆叠。
   # 若训练时配了 n 帧历史，这里要填相应的帧数列表，例如 [0, 1, 2] 表示保留最近 3 帧。
@@ -90,7 +94,28 @@ m20/robot_lab:
   default_commands: [0.0, 0.0, 0.0]
 
   # 观测削波：把过大的观测值截断，防止异常传感器读数把网络打飞。
+  # 注意 height_scan 不走这里，它有自己独立的裁剪值，见下方 height_scan_clip。
   clip_obs: 100.0
+
+  # ---- 地形高度扫描 height_scan ----
+  # 对应训练侧 rough_env_cfg.py 中打开的那一项（原先是 # height_scan = None 被注释屏蔽，
+  # 现已启用并设 scale = 1.0），这就是策略能"看见"地形起伏的输入。
+  # 187 个点 = (1.6/0.1 + 1) × (1.0/0.1 + 1) = 17 × 11，
+  # 对应 IsaacLab RayCaster 的 GridPattern(resolution=0.1, size=[1.6, 1.0])。
+  height_scan_grid_x: 17        # 沿机体系 x（前后）的采样点数
+  height_scan_grid_y: 11        # 沿机体系 y（左右）的采样点数
+  height_scan_resolution: 0.1   # 采样间距（米）
+  height_scan_range: 2.0        # 向下射线的最大射程（米）
+  height_scan_geom_group: 3     # 只对该 group 的几何体（地形）发射射线，避免打到自身腿脚
+  height_scan_scale: 1.0        # 训练侧 height_scan.scale
+  height_scan_clip: 1.0         # IsaacLab 的 mdp.height_scan 会把观测裁到 ±1.0
+
+  # 地形观测的参考基准（米）。输出 = 命中点世界高度 − 该值。
+  #   0.0  → 直接用世界高度，平地上该值约为 0（对应 IsaacLab offset=0 的默认写法）
+  #   实测依据：拿真实 policy.pt 做扫描，地形观测越接近 0，输出动作越接近静止站姿；
+  #   若误用「基座到地面的距离」（平地 0.59），腿的动作幅度会放大到约 6 倍。
+  # 若日后确认策略以基座为基准训练，把它设成基座站立高度即可切回。
+  height_scan_ref_offset: 0.0
 
   # ===========================================================================
   # 三、输入归一化缩放

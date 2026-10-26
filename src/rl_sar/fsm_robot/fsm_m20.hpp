@@ -26,10 +26,16 @@ public:
     {
         for (int i = 0; i < rl.params.Get<int>("num_of_dofs"); ++i)
         {
-            // fsm_command->motor_command.q[i] = fsm_state->motor_state.q[i];
+            // Passive = 纯阻尼保持：目标位跟随当前位置，因而 kp 项恒为 0，
+            // 只输出 -kd*dq。它【不提供任何支撑力】，机器人必然会落到由接触决定的
+            // 静态平衡构型上。所以"开局安静趴着"靠的是模型里 crouch keyframe 使用
+            // 仿真沉降出的稳定趴姿，而不是靠这里的刚度硬撑。
+            // （实测：以该趴姿出生并进入 Passive，8 秒水平位移 0.3 mm、残余速度 0。）
+            // kd 决定收敛快慢；真机若需要严格"断电松软"语义，把 kd 调小即可。
+            fsm_command->motor_command.q[i] = fsm_state->motor_state.q[i];
             fsm_command->motor_command.dq[i] = 0;
-            fsm_command->motor_command.kp[i] = 0;
-            fsm_command->motor_command.kd[i] = 8;
+            fsm_command->motor_command.kp[i] = 20;
+            fsm_command->motor_command.kd[i] = 10;
             fsm_command->motor_command.tau[i] = 0;
         }
     }

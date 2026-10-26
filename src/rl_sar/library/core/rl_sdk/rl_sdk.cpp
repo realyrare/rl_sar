@@ -110,6 +110,28 @@ std::vector<float> RL::ComputeObservation()
         {
             obs_list.push_back(this->obs.actions);
         }
+        else if (observation == "height_scan")
+        {
+            // 对齐 IsaacLab 的 mdp.height_scan：先乘 scale，再做裁剪。
+            // 训练侧 height_scan.scale = 1.0，且标准实现会把该项裁到 [-1.0, 1.0]。
+            // 这里不能套用全局 clip_obs(100)——那等于没裁，模型会看到训练时从未出现的数值范围。
+            float hs_scale = this->params.Get<float>("height_scan_scale", 1.0f);
+            float hs_clip = this->params.Get<float>("height_scan_clip", 1.0f);
+            std::vector<float> height_scan_scaled = this->obs.height_scan;
+            for (auto &v : height_scan_scaled)
+            {
+                v *= hs_scale;
+                if (v > hs_clip)
+                {
+                    v = hs_clip;
+                }
+                else if (v < -hs_clip)
+                {
+                    v = -hs_clip;
+                }
+            }
+            obs_list.push_back(height_scan_scaled);
+        }
         // ============= Other Observations =============
         else if (observation == "whole_body_tracking/motion_command")
         {
@@ -194,6 +216,14 @@ void RL::InitObservations()
     this->obs.dof_vel.resize(this->params.Get<int>("num_of_dofs"), 0.0f);
     this->obs.actions.clear();
     this->obs.actions.resize(this->params.Get<int>("num_of_dofs"), 0.0f);
+    // 只有配置了网格尺寸的机型才需要地形扫描；默认 0 表示不使用，避免影响其余机器人。
+    this->obs.height_scan.clear();
+    int hs_grid_x = this->params.Get<int>("height_scan_grid_x", 0);
+    int hs_grid_y = this->params.Get<int>("height_scan_grid_y", 0);
+    if (hs_grid_x > 0 && hs_grid_y > 0)
+    {
+        this->obs.height_scan.resize(hs_grid_x * hs_grid_y, 0.0f);
+    }
     this->ComputeObservation();
 }
 
