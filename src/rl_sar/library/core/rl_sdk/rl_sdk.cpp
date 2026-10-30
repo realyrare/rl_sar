@@ -297,6 +297,22 @@ void RL::ComputeOutput(const std::vector<float> &actions, std::vector<float> &ou
     output_dof_pos = pos_actions_scaled + this->params.Get<std::vector<float>>("default_dof_pos");
     output_dof_vel = vel_actions_scaled;
     output_dof_tau = this->params.Get<std::vector<float>>("rl_kp") * (all_actions_scaled + this->params.Get<std::vector<float>>("default_dof_pos") - this->obs.dof_pos) - this->params.Get<std::vector<float>>("rl_kd") * this->obs.dof_vel;
+
+    // 轮子的"双重阻尼"问题（关键，之前只在 config 注释里说明过，代码却没实现）：
+    //   轮关节是速度伺服 —— rl_kp=0，目标转速 = action_scale * action。
+    //   RobotControl / SetCommand 侧已经算了 kd*(cmd_dq - dq)，它本身就等价于 Isaac
+    //   的 DCMotor：torque = damping * (v_cmd - dq)。
+    //   若这里再额外减去 rl_kd*dq，总力矩就变成 kd*(cmd_dq - dq) - kd*dq
+    //   = kd*(cmd_dq - 2*dq)，稳态解为 dq = cmd_dq/2 —— **实际轮速只有命令的一半**。
+    //   轮子跟不上会反馈进观测，策略越推越猛，表现为行走时全身抖动。
+    // wheel_tau_damping = false 时对轮关节不加这项前馈阻尼（默认 true 以兼容其余机型）。
+    if (!this->params.Get<bool>("wheel_tau_damping", true))
+    {
+        for (int i : this->params.Get<std::vector<int>>("wheel_indices"))
+        {
+            output_dof_tau[i] = 0.0f;
+        }
+    }
     output_dof_tau = clamp(output_dof_tau, -this->params.Get<std::vector<float>>("torque_limits"), this->params.Get<std::vector<float>>("torque_limits"));
 }
 

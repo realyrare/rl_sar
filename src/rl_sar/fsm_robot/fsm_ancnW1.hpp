@@ -161,13 +161,38 @@ public:
         std::cout << LOGGER::NOTE << "Entered passive mode. Press '0' (Keyboard) or 'A' (Gamepad) to switch to RLFSMStateGetUp." << std::endl;
     }
 
+    // 为什么这里不是"完全松软"（kp = 0）
+    // ------------------------------------
+    // 原先这里对所有关节只给阻尼（kp=0, kd=8），腿撑不住机身，于是开机后机器
+    // 人一路塌下去：1 秒就掉到 z≈0.29，最终停在前倾 17° 的怪姿态，且**再也站
+    // 不起来** —— 实测从趴姿 GetUp，kp 从 80 提到 400 全都失败（最高只抬到
+    // z≈0.43 且会翻车），因为后腿折叠到关节极限（-2.25 rad，range 下限 -2.286）
+    // 后进入奇异位形，伸展时轮子打滑而不是把机身撑起来。也就是说 ancnW1 一旦
+    // 趴下就无法自救，这跟 M20（趴姿是它的稳定态、且能自行起身）完全不同。
+    //
+    // 所以本状态改为"开机保持站立姿态"：用 fixed_kp / fixed_kd 把关节保持在
+    // default_dof_pos。静态所需力矩实测只有 8 N·m（腿限 113），负担极小，仍
+    // 是外力可推动的松软手感，但不会自己塌成怪姿态，随时可以按 0 进入 GetUp。
+    //
+    // 想恢复成原来的完全松软（仅阻尼），把下面 kp 那一行改回 0 即可。
+    // 为什么这里改成"跟随当前姿态"（与 m20 完全一致）
+    // ----------------------------------------------------
+    // 之前这里曾是"开机硬撑站立"（fixed_kp 拉向 default_dof_pos），当时的原因是
+    // 旧趴姿（后腿折叠到 -2.25 rad 关节极限附近）GetUp 起不来。现在 keyframe[0]
+    // 已换成新的 crouch（thigh=-1.222/calf=+1.571，远离限位、远离奇异位形），
+    // 用户要求与 m20 一致：出生趴着、按 0 起立、按 9 趴回。硬撑站立会让出生
+    // keyframe 形同虚设 —— 一进 Passive 就被拉回站姿。
+    // 本状态现在与 fsm_m20.hpp 的 Passive 逐行相同：目标位跟随当前位置（kp 项
+    // 恒为 0，只输出 -kd*dq 的小刚度保持），姿态由 crouch keyframe 决定。
+    // 若实测从新趴姿 GetUp 仍困难，优先调 GetUp 的时长/力度，而不是改回硬撑站立。
     void Run() override
     {
         for (int i = 0; i < rl.params.Get<int>("num_of_dofs"); ++i)
         {
+            fsm_command->motor_command.q[i] = fsm_state->motor_state.q[i];
             fsm_command->motor_command.dq[i] = 0;
-            fsm_command->motor_command.kp[i] = 0;
-            fsm_command->motor_command.kd[i] = 8;
+            fsm_command->motor_command.kp[i] = 20;
+            fsm_command->motor_command.kd[i] = 10;
             fsm_command->motor_command.tau[i] = 0;
         }
     }
@@ -193,10 +218,13 @@ public:
     float percent_getup = 0.0f;
     // crouch pose before standing up, POLICY order:
     // 12 leg joints (fl_hip, fl_thigh, fl_calf, fr_..., hl_..., hr_...) + 4 wheels
+    // 训练侧 assets/ancn.py 的 init_state.joint_pos 全 0 —— URDF 零位本身就是屈膝
+    // 站姿，所以 GetUp 的目标只有 default_dof_pos（全 0），不再需要"先深蹲再起立"
+    // 的中间姿态（那是旧站姿体系 0.6/-1.0 时代的产物，符号体系是 m20 的，对 ancnW1 反向）。
     std::vector<float> pre_running_pos = {
-        0.00,  0.90, -1.60, 0.00,  0.90, -1.60,
-        0.00, -0.90,  1.60, 0.00, -0.90,  1.60,
-        0.00,  0.00,  0.00, 0.00
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00, 0.00, 0.00,
+        0.00, 0.00, 0.00, 0.00
     };
     bool stand_from_passive = true;
 
@@ -612,7 +640,8 @@ public:
 
     void Run() override
     {
-        Interpolate(percent_getdown, rl.now_state.motor_state.q, rl.start_state.motor_state.q, 2.0f, "Getting down", true);
+        // 2.5s：下蹲 0.29 m（0.537→0.250）需要足够慢，快了触地冲击会把机身弹歪。
+        Interpolate(percent_getdown, rl.now_state.motor_state.q, rl.start_state.motor_state.q, 2.5f, "Getting down", true);
     }
 
     void Exit() override {}

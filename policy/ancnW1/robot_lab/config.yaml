@@ -34,15 +34,49 @@
 #   10,11->wheel15, i.e. the 12 leg dims are grouped per leg fl, fr, hl, hr.
 ancnW1/robot_lab:
   model_name: "policy.pt"
-  num_observations: 57
-  observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions"]
+  # 244 = 本体 57（ang_vel 3 + gravity_vec 3 + commands 3 + dof_pos 16 + dof_vel 16 + actions 16）
+  #     + 地形 187（17 × 11 的高度扫描网格），见下方 height_scan 段。
+  num_observations: 244
+  observations: ["ang_vel", "gravity_vec", "commands", "dof_pos", "dof_vel", "actions", "height_scan"]
   observations_history: []  # 0 is the latest observation
   observations_history_priority: "time"  # "time" or "term" priority
   default_commands: [0.0, 0.0, 0.0]
   clip_obs: 100.0
+
+  # ---- 地形高度扫描 height_scan ----
+  # 为什么必须有这一段：10-26 16:33 换上的新 policy.pt 是**带高度扫描**的 rough 策略。
+  # 实测 torch::jit::load 之后网络第一层权重是 244×512，即策略要求 244 维输入；而这里
+  # 原本只配了 57 维纯本体感知观测，于是一按 1 进 RL，推理就抛
+  #   RuntimeError: mat1 and mat2 shapes cannot be multiplied (1x57 and 244x512)
+  # 机器人随即失控。
+  #   244 = 57 + 187，187 = 17 × 11
+  # 对应训练侧 velocity_env_cfg.py 的 RayCaster：
+  #   pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.6, 1.0])
+  # 并在 wheeled/ancnw1/rough_env_cfg.py 里用
+  #   self.observations.policy.height_scan.scale = 1.0
+  # 打开了该项。参数与 m20/robot_lab/config.yaml 完全一致（同一套扫描配置）。
+  height_scan_grid_x: 17        # 沿机体系 x（前后）的采样点数
+  height_scan_grid_y: 11        # 沿机体系 y（左右）的采样点数
+  height_scan_resolution: 0.1   # 采样间距（米）
+  height_scan_range: 2.0        # 向下射线的最大射程（米）
+  height_scan_geom_group: 3     # 只对该 group 的几何体（地形）发射射线，避免打到自身腿脚
+  height_scan_scale: 1.0        # 训练侧 height_scan.scale
+  height_scan_clip: 1.0         # IsaacLab 的 mdp.height_scan 会把观测裁到 ±1.0
+  # 输出 = 命中点世界高度 − 该值。0.0 表示直接用世界高度（平地时约 0），
+  # 与 m20 一致；不要用基座高度（平地 0.659），否则腿的动作会被放大。
+  height_scan_ref_offset: 0.0
+  # ---- 高度扫描的基准（A/B 用，改这里不需要重新编译）----
+  #   0 = 世界绝对高度：平地约 0（改动前的旧行为，当前默认）
+  #   1 = 相对基座高度：平地站立约 -0.537（IsaacLab RayCaster 的语义）
+  # 两者相差一个「基座高度」的常数。目前不确定这个策略是按哪种训练的，
+  # 实测哪种稳就用哪种；启动日志会打印一次 height_scan 的统计值便于核对。
+  height_scan_base_relative: 0
+
   # legs keep the training-side +-100 clip.
   # wheels: the URDF wheel velocity limit is 94.248 rad/s and MuJoCo has no joint
-  # velocity limit, so the action is clipped here instead: 94.248 / 5.0 = 18.85.
+  # velocity limit, so the raw action is clipped instead — note this clip is applied
+  # BEFORE action_scale (see rl_sim_mujoco.cpp Forward), so it must be re-derived
+  # whenever the wheel scale changes: 94.248 / 5.0 = 18.85.
   clip_actions_upper: [100.0, 100.0, 100.0,
                        100.0, 100.0, 100.0,
                        100.0, 100.0, 100.0,
@@ -79,8 +113,12 @@ ancnW1/robot_lab:
              2.0, 2.0, 2.0,
              5.0, 5.0, 5.0, 5.0]
   num_of_dofs: 16
-  # legs: hip 0.125, thigh/calf 0.25 (position action)
-  # wheels: velocity action, scale 5.0 rad/s per unit action
+  # ⚠️ 这里的取值来自训练侧 rough_env_cfg.py 的 __post_init__ 覆盖值，
+  #    不是文件开头 AncnW1ActionsCfg 的类默认参数 —— 那两个只是占位：
+  #      self.actions.joint_pos.scale = {".*_hip_joint": 0.125, "^(?!.*_hip_joint).*": 0.25}
+  #      self.actions.joint_vel.scale = 5.0
+  #    即 hip 只有 0.125，轮子是 5.0 rad/s（类定义里写的 20.0 会被这几行覆盖）。
+  #    （曾误改成统一 0.25 / 轮子 20.0，导致轮子被命令到 4 倍转速，行走抖动，已回滚。）
   action_scale: [0.125, 0.25, 0.25,
                  0.125, 0.25, 0.25,
                  0.125, 0.25, 0.25,
@@ -104,10 +142,14 @@ ancnW1/robot_lab:
                   113.0, 113.0, 113.0,
                   113.0, 113.0, 113.0,
                   19.3, 19.3, 19.3, 19.3]
-  default_dof_pos: [ 0.00,  0.60, -1.00,
-                     0.00,  0.60, -1.00,
-                     0.00, -0.60,  1.00,
-                     0.00, -0.60,  1.00,
+  # ⚠️ 必须与训练侧 assets/ancn.py 的 init_state.joint_pos 完全一致 —— 那里全部是 0：
+  # URDF 零位本身就是屈膝站姿（轮心在基座下方 0.427 m，0.427 + 0.11 轮半径 = 0.537，
+  # 与训练初始高度 0.54 吻合）。之前错填成 m20 风格的 [0.6,-1.0]，导致观测
+  # dof_pos_rel 和动作目标都带固定偏移，策略输出的姿态全部作废（腿型怪异、无法行走）。
+  default_dof_pos: [ 0.00,  0.00,  0.00,
+                     0.00,  0.00,  0.00,
+                     0.00,  0.00,  0.00,
+                     0.00,  0.00,  0.00,
                      0.00,  0.00,  0.00,  0.00]
   # policy index -> MJCF/physical joint index
   # MJCF joint order is depth-first: fl_hip, fl_thigh, fl_calf, fl_wheel,
